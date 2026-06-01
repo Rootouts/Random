@@ -2,7 +2,7 @@
 // Uses the Part B libs: ./lib/supabase, ./lib/socket, ./lib/webrtc, ./lib/locations, ./lib/pay
 // NOTE: this runs in your Vite project (it needs the npm deps + your backend), not the chat preview.
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Mic, MicOff, Phone, PhoneOff, SkipForward, Users, MapPin, Crown, Send, Search,
   Clock, X, Check, Shield, ArrowLeft, UserPlus, Lock, LogOut, Eye, Globe, Plus,
@@ -29,11 +29,34 @@ function Wave({ active, color = "bg-blue-500" }) {
   return <div className="flex items-center justify-center gap-1 h-10">{bars.map((h,i) => <div key={i} style={{height:`${h}px`}} className={`w-1 rounded-full transition-all duration-100 ${color}`} />)}</div>;
 }
 
+// --- defined OUTSIDE App so they never remount on re-render (keeps chat focus + audio alive) ---
+function Page({ children, center }) {
+  return (
+    <div className="min-h-screen w-full bg-white text-gray-800 flex justify-center">
+      <div className={`w-full max-w-md flex-1 flex flex-col px-5 py-6 ${center ? "justify-center" : ""}`}>{children}</div>
+    </div>
+  );
+}
+function Brand({ big }) {
+  return (
+    <div className="flex items-center gap-2">
+      <div className={`${big ? "h-12 w-12" : "h-8 w-8"} rounded-full bg-blue-600 flex items-center justify-center`}><Headphones className={big ? "h-6 w-6 text-white" : "h-4 w-4 text-white"} /></div>
+      <span className={`font-semibold tracking-tight ${big ? "text-3xl" : "text-xl"}`}>RandomTalk</span>
+    </div>
+  );
+}
+function Hdr({ title, onBack }) {
+  return <div className="flex items-center gap-2 mb-5"><button onClick={onBack} className="p-2 -ml-2 rounded-full hover:bg-gray-100"><ArrowLeft className="h-5 w-5 text-gray-600" /></button><span className="text-xl font-medium">{title}</span></div>;
+}
+function RemoteAudio({ map }) {
+  return <>{Object.entries(map).map(([id, s]) => <audio key={id} autoPlay playsInline ref={el => { if (el && el.srcObject !== s) el.srcObject = s; }} />)}</>;
+}
+
 export default function App() {
   // ---- session / identity ----
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
-  const [guest, setGuest] = useState(null);                 // { name, gender, loc, coord }
+  const [guest, setGuest] = useState(null);
   const me = guest || (profile && { ...profile, id: session?.user?.id, premium: profile.premium, role: profile.role });
   const isPremium = !!me?.premium;
   const isAdmin = profile?.role === "admin";
@@ -47,7 +70,7 @@ export default function App() {
   const [autoConnect, setAutoConnect] = useState(false);
 
   // ---- call ----
-  const [match, setMatch] = useState(null);                 // { roomId, peerId, peer, initiator }
+  const [match, setMatch] = useState(null);
   const roomRef = useRef(null);
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
@@ -64,7 +87,7 @@ export default function App() {
   const [history, setHistory] = useState([]);
 
   // ---- conference ----
-  const [conf, setConf] = useState(null);                   // { roomId, code, peers:{} }
+  const [conf, setConf] = useState(null);
   // ---- admin ----
   const [adminRooms, setAdminRooms] = useState([]);
   const [adminCall, setAdminCall] = useState(null);
@@ -73,11 +96,13 @@ export default function App() {
 
   const media = useRef(null);
   const adminMedia = useRef(null);
-  const routeRef = useRef(null);                            // which manager receives "signal"
+  const routeRef = useRef(null);
   const chatRef = useRef(null);
   const autoRef = useRef(autoConnect); autoRef.current = autoConnect;
   const modeRef = useRef(mode); modeRef.current = mode;
   const wantRef = useRef(want); wantRef.current = want;
+  const matchRef = useRef(match); matchRef.current = match;
+  const secRef = useRef(seconds); secRef.current = seconds;
 
   /* ---------- auth bootstrap ---------- */
   useEffect(() => {
@@ -104,7 +129,7 @@ export default function App() {
     });
     adminMedia.current = createMedia(socket, {
       onStream: (id, s) => setAdminStreams(p => ({ ...p, [id]: s })),
-      sendAudioOnAnswer: false,                              // listen-only until admin hits Talk
+      sendAudioOnAnswer: false,
     });
     routeRef.current = media.current;
 
@@ -123,22 +148,19 @@ export default function App() {
     socket.on("peer:left", () => endLocal(true));
     socket.on("monitored", ({ on }) => setMonitored(on));
 
-    // conference
     socket.on("conf:created", ({ code, roomId }) => { roomRef.current = roomId; setConf({ roomId, code, peers: {} }); setScreen("conf"); media.current.initMic(); });
     socket.on("conf:peers", async ({ roomId, peers }) => {
       roomRef.current = roomId; setConf({ roomId, code: roomId.replace("c_",""), peers: Object.fromEntries(peers.map(p => [p.id, p])) });
       setScreen("conf"); await media.current.initMic();
-      peers.forEach(p => media.current.call(p.id));          // joiner offers to existing peers
+      peers.forEach(p => media.current.call(p.id));
     });
     socket.on("peer:joined", ({ peerId, info }) => setConf(c => c ? { ...c, peers: { ...c.peers, [peerId]: { id: peerId, ...info } } } : c));
 
-    // friend direct call (needs the small server addition shown below the artifact)
     socket.on("invite", ({ roomId, from, fromSid }) => setIncoming({ roomId, from, fromSid }));
 
-    // admin
     socket.on("admin:rooms", (list) => setAdminRooms(list));
-    socket.on("admin:monitorStart", ({ adminId }) => media.current.call(adminId, { sendAudio: true })); // participant streams to admin
-    socket.on("admin:talk", () => {});                       // (the admin's renegotiation adds their track)
+    socket.on("admin:monitorStart", ({ adminId }) => media.current.call(adminId, { sendAudio: true }));
+    socket.on("admin:talk", () => {});
 
     return () => { socket.off("signal", onSignal); socket.removeAllListeners(); };
   }, [me?.id, guest?.name]);
@@ -156,7 +178,8 @@ export default function App() {
   function next() { socket.emit("room:leave", { roomId: roomRef.current }); media.current.closeAll(); setStreams({}); startCall(); }
   function endLocal(skipAuto) {
     media.current?.closeAll(); setStreams({});
-    if (match) setHistory(h => [{ name: match.peer?.name, loc: match.peer?.loc, dur: seconds, when: "Just now" }, ...h].slice(0, 15));
+    const mt = matchRef.current;
+    if (mt) setHistory(h => [{ name: mt.peer?.name, loc: mt.peer?.loc, dur: secRef.current, when: "Just now" }, ...h].slice(0, 15));
     if (!skipAuto && autoRef.current) { setMatch(null); startCall(); }
     else { setMatch(null); roomRef.current = null; setScreen("lobby"); }
   }
@@ -181,7 +204,6 @@ export default function App() {
   function callFriend(uid) { if (!isPremium) return setOverlay("premium"); socket.emit("invite", { toUserId: uid }); }
   function acceptInvite() { if (incoming) { socket.emit("invite:accept", { roomId: incoming.roomId, toSid: incoming.fromSid }); setIncoming(null); } }
 
-  // people search (registered users by name)
   useEffect(() => {
     const t = setTimeout(async () => {
       const q = findQ.trim(); if (q.length < 2) return setFindRes([]);
@@ -193,7 +215,6 @@ export default function App() {
 
   function signOut() { socket.disconnect(); supabase.auth.signOut(); setProfile(null); setGuest(null); setSession(null); setScreen("landing"); }
 
-  // admin monitor
   function adminRefresh() { socket.emit("admin:rooms"); }
   function adminListen(roomId) { routeRef.current = adminMedia.current; setAdminCall(roomId); setAdminTalking(false); setAdminStreams({}); socket.emit("admin:monitor", { roomId, talk: false }); }
   async function adminTalk(on) {
@@ -207,19 +228,6 @@ export default function App() {
   useEffect(() => { if (screen === "admin") { adminRefresh(); const t = setInterval(adminRefresh, 4000); return () => clearInterval(t); } }, [screen]);
 
   /* =================== RENDER =================== */
-  const Page = ({ children, center }) => (
-    <div className="min-h-screen w-full bg-white text-gray-800 flex justify-center">
-      <div className={`w-full max-w-md flex-1 flex flex-col px-5 py-6 ${center ? "justify-center" : ""}`}>{children}</div>
-    </div>
-  );
-  const Brand = ({ big }) => (
-    <div className="flex items-center gap-2">
-      <div className={`${big ? "h-12 w-12" : "h-8 w-8"} rounded-full bg-blue-600 flex items-center justify-center`}><Headphones className={big ? "h-6 w-6 text-white" : "h-4 w-4 text-white"} /></div>
-      <span className={`font-semibold tracking-tight ${big ? "text-3xl" : "text-xl"}`}>RandomTalk</span>
-    </div>
-  );
-  const Hdr = ({ title }) => <div className="flex items-center gap-2 mb-5"><button onClick={() => setScreen("lobby")} className="p-2 -ml-2 rounded-full hover:bg-gray-100"><ArrowLeft className="h-5 w-5 text-gray-600" /></button><span className="text-xl font-medium">{title}</span></div>;
-  const RemoteAudio = ({ map }) => <>{Object.entries(map).map(([id, s]) => <audio key={id} autoPlay ref={el => { if (el && el.srcObject !== s) el.srcObject = s; }} />)}</>;
 
   /* LANDING */
   if (screen === "landing")
@@ -236,9 +244,9 @@ export default function App() {
       </Page>
     );
 
-  /* AUTH (login + signup) */
+  /* AUTH */
   if (screen === "auth")
-    return <Auth onBack={() => setScreen("landing")} onLocOpen={() => setLocOpen(true)} loc={guest?._loc}
+    return <Auth onBack={() => setScreen("landing")} onLocOpen={() => setLocOpen(true)}
       pickedLoc={locOpen ? null : guest?._loc}
       LocPicker={locOpen ? <LocationPicker onClose={() => setLocOpen(false)} onPick={(l) => { setGuest(g => ({ ...(g || {}), _loc: l })); setLocOpen(false); }} /> : null} />;
 
@@ -311,7 +319,7 @@ export default function App() {
   if (screen === "find")
     return (
       <Page>
-        <Hdr title="Find people" />
+        <Hdr title="Find people" onBack={() => setScreen("lobby")} />
         <div className="flex items-center gap-2 border border-gray-300 rounded-full px-4 py-2.5 focus-within:border-blue-600"><Search className="h-4 w-4 text-gray-400" /><input autoFocus value={findQ} onChange={e => setFindQ(e.target.value)} placeholder="Search people by name" className="flex-1 outline-none text-base" /></div>
         <div className="flex-1 overflow-y-auto mt-3">
           {findRes.map((s) => { const fr = friends.find(f => f.id === s.id); return (
@@ -387,7 +395,7 @@ export default function App() {
   if (screen === "confSetup")
     return (
       <Page>
-        <Hdr title="Group call" />
+        <Hdr title="Group call" onBack={() => setScreen("lobby")} />
         <p className="text-gray-500 text-base mb-6">Talk with several people at once. Create a room and share the code, or join one.</p>
         <button onClick={() => socket.emit("conf:create")} className="w-full py-3.5 rounded-full bg-blue-600 text-white font-medium text-lg flex items-center justify-center gap-2 hover:bg-blue-700"><Plus className="h-5 w-5" />Create a room</button>
         <div className="flex items-center gap-3 my-5 text-gray-400 text-sm"><div className="flex-1 h-px bg-gray-200" />or join<div className="flex-1 h-px bg-gray-200" /></div>
@@ -416,7 +424,7 @@ export default function App() {
   if (screen === "friends")
     return (
       <Page>
-        <Hdr title="Friends" />
+        <Hdr title="Friends" onBack={() => setScreen("lobby")} />
         {!isPremium && <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 mb-4 text-sm text-amber-700 flex items-center gap-2"><Crown className="h-4 w-4" />Calling friends needs Premium. <button onClick={() => setOverlay("premium")} className="underline font-medium">Upgrade</button></div>}
         {friends.length === 0 ? <div className="flex-1 flex flex-col items-center justify-center text-gray-400 gap-2"><Users className="h-10 w-10" /><p className="text-sm">No friends yet.</p></div> :
           <div className="space-y-2">{friends.map(f => <div key={f.id} className="flex items-center gap-3 py-2 border-b border-gray-100"><div className={`h-10 w-10 rounded-full text-white flex items-center justify-center font-semibold ${aColor(f.name)}`}>{f.name?.[0]}</div><div className="flex-1"><div className="font-medium">{f.name}</div><div className="text-sm text-gray-500">{f.loc || "—"}</div></div>{f.status === "pending" ? <span className="text-sm text-amber-600">Pending…</span> : <button onClick={() => callFriend(f.id)} className="h-10 w-10 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center"><Phone className="h-4 w-4" /></button>}</div>)}</div>}
@@ -428,7 +436,7 @@ export default function App() {
   if (screen === "history")
     return (
       <Page>
-        <Hdr title="Call history" />
+        <Hdr title="Call history" onBack={() => setScreen("lobby")} />
         {history.length === 0 ? <div className="flex-1 flex flex-col items-center justify-center text-gray-400 gap-2"><Clock className="h-10 w-10" /><p className="text-sm">No calls yet.</p></div> :
           <div className="space-y-1">{history.map((h, i) => <div key={i} className="flex items-center gap-3 py-2 border-b border-gray-100"><div className={`h-10 w-10 rounded-full text-white flex items-center justify-center font-semibold ${aColor(h.name)}`}>{h.name?.[0]}</div><div className="flex-1"><div className="font-medium">{h.name}</div><div className="text-sm text-gray-500">{h.loc || "—"} · {h.when}</div></div><div className="text-sm font-mono text-gray-400">{fmt(h.dur)}</div></div>)}</div>}
       </Page>
@@ -439,7 +447,7 @@ export default function App() {
     return (
       <Page>
         <RemoteAudio map={adminStreams} />
-        <Hdr title="Admin — live calls" />
+        <Hdr title="Admin — live calls" onBack={() => setScreen("lobby")} />
         <div className="space-y-1">
           {adminRooms.length === 0 && <div className="text-center text-sm text-gray-400 py-8">No active calls right now.</div>}
           {adminRooms.map(r => (
