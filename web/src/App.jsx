@@ -1,8 +1,8 @@
 // src/App.jsx — production-wired RandomTalk
 // Uses the Part B libs: ./lib/supabase, ./lib/socket, ./lib/webrtc, ./lib/locations, ./lib/pay
-// NOTE: this runs in your Vite project (it needs the npm deps + your backend), not the chat preview.
+// NOTE: runs in your Vite project (needs npm deps + backend), not the chat preview.
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import {
   Mic, MicOff, Phone, PhoneOff, SkipForward, Users, MapPin, Crown, Send, Search,
   Clock, X, Check, Shield, ArrowLeft, UserPlus, Lock, LogOut, Eye, Globe, Plus,
@@ -13,12 +13,17 @@ import { supabase } from "./lib/supabase";
 import { socket } from "./lib/socket";
 import { createMedia } from "./lib/webrtc";
 import { checkout } from "./lib/pay";
-import { getCountries, searchCities } from "./lib/locations";
+import { getCountries, getStates, getCities, getCitiesOfCountry } from "./lib/locations";
 
 const COLORS = ["bg-blue-500","bg-emerald-500","bg-violet-500","bg-amber-500","bg-rose-500","bg-cyan-500","bg-indigo-500","bg-teal-500"];
 const aColor = (n="?") => COLORS[(n.charCodeAt(0) + n.length) % COLORS.length];
 const GenderIcon = ({ g, className }) => <span className={className}>{g === "male" ? "♂" : g === "female" ? "♀" : "⚧"}</span>;
 const fmt = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+const ls = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+  del: (k) => { try { localStorage.removeItem(k); } catch {} },
+};
 
 function Wave({ active, color = "bg-blue-500" }) {
   const [bars, setBars] = useState(Array(20).fill(5));
@@ -29,7 +34,14 @@ function Wave({ active, color = "bg-blue-500" }) {
   return <div className="flex items-center justify-center gap-1 h-10">{bars.map((h,i) => <div key={i} style={{height:`${h}px`}} className={`w-1 rounded-full transition-all duration-100 ${color}`} />)}</div>;
 }
 
-// --- defined OUTSIDE App so they never remount on re-render (keeps chat focus + audio alive) ---
+// Self-contained timer so the call screen (and chat box) doesn't re-render every second.
+function CallTimer() {
+  const [s, setS] = useState(0);
+  useEffect(() => { const t = setInterval(() => setS(x => x + 1), 1000); return () => clearInterval(t); }, []);
+  return <div className="mt-2 font-mono text-gray-400">{fmt(s)}</div>;
+}
+
+// ----- module-scope UI (never remounts on re-render) -----
 function Page({ children, center }) {
   return (
     <div className="min-h-screen w-full bg-white text-gray-800 flex justify-center">
@@ -52,11 +64,39 @@ function RemoteAudio({ map }) {
   return <>{Object.entries(map).map(([id, s]) => <audio key={id} autoPlay playsInline ref={el => { if (el && el.srcObject !== s) el.srcObject = s; }} />)}</>;
 }
 
+// ----- consent gate (shown once, stored locally) -----
+function Consent({ onAgree }) {
+  const [ok, setOk] = useState(false);
+  return (
+    <Page center>
+      <div className="flex flex-col gap-4">
+        <Brand big />
+        <h2 className="text-xl font-medium mt-2">Before you start</h2>
+        <div className="text-sm text-gray-600 space-y-2">
+          <p>RandomTalk connects you by voice with strangers. By continuing you understand and agree that:</p>
+          <p>• You are <b>18 years or older</b>.</p>
+          <p>• Calls and chats <b>may be monitored or recorded</b> for safety and moderation.</p>
+          <p>• You will not share illegal, abusive, hateful, or sexual content, and you will be respectful.</p>
+          <p>• Limited data (your name, gender, location, and messages) is stored to run the service.</p>
+          <p>• You can be reported and blocked for violating these rules.</p>
+        </div>
+        <label className="flex items-start gap-2 text-sm text-gray-700 cursor-pointer mt-1">
+          <input type="checkbox" checked={ok} onChange={e => setOk(e.target.checked)} className="mt-1" />
+          <span>I am 18+ and I agree to the <a href="/terms" className="text-blue-600 underline">Terms</a>, the <a href="/privacy" className="text-blue-600 underline">Privacy Policy</a>, and to calls being monitored for safety.</span>
+        </label>
+        <button disabled={!ok} onClick={onAgree} className="w-full py-3.5 rounded-full bg-blue-600 text-white font-medium text-lg disabled:opacity-40 hover:bg-blue-700">Agree & continue</button>
+      </div>
+    </Page>
+  );
+}
+
 export default function App() {
-  // ---- session / identity ----
+  // ---- identity ----
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
   const [guest, setGuest] = useState(null);
+  const [booting, setBooting] = useState(true);
+  const [consented, setConsented] = useState(() => ls.get("rt_consent_v1") === "1");
   const me = guest || (profile && { ...profile, id: session?.user?.id, premium: profile.premium, role: profile.role });
   const isPremium = !!me?.premium;
   const isAdmin = profile?.role === "admin";
@@ -72,10 +112,10 @@ export default function App() {
   // ---- call ----
   const [match, setMatch] = useState(null);
   const roomRef = useRef(null);
+  const callStartRef = useRef(0);
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
   const [muted, setMuted] = useState(false);
-  const [seconds, setSeconds] = useState(0);
   const [monitored, setMonitored] = useState(false);
   const [streams, setStreams] = useState({});
   const [incoming, setIncoming] = useState(null);
@@ -86,9 +126,8 @@ export default function App() {
   const [findRes, setFindRes] = useState([]);
   const [history, setHistory] = useState([]);
 
-  // ---- conference ----
+  // ---- conference / admin ----
   const [conf, setConf] = useState(null);
-  // ---- admin ----
   const [adminRooms, setAdminRooms] = useState([]);
   const [adminCall, setAdminCall] = useState(null);
   const [adminStreams, setAdminStreams] = useState({});
@@ -99,24 +138,27 @@ export default function App() {
   const routeRef = useRef(null);
   const chatRef = useRef(null);
   const autoRef = useRef(autoConnect); autoRef.current = autoConnect;
-  const modeRef = useRef(mode); modeRef.current = mode;
-  const wantRef = useRef(want); wantRef.current = want;
   const matchRef = useRef(match); matchRef.current = match;
-  const secRef = useRef(seconds); secRef.current = seconds;
 
-  /* ---------- auth bootstrap ---------- */
+  /* ---------- boot: restore session or guest ---------- */
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const g = ls.get("rt_guest");
+    supabase.auth.getSession().then(({ data }) => {
+      if (data.session) setSession(data.session);
+      else if (g) { try { setGuest(JSON.parse(g)); setScreen("lobby"); } catch {} }
+      setBooting(false);
+    });
     const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
     return () => sub.subscription.unsubscribe();
   }, []);
   useEffect(() => { if (session) loadProfile(); }, [session]);
   async function loadProfile() {
     const { data } = await supabase.from("profiles").select("*").eq("id", session.user.id).single();
-    setProfile(data); setGuest(null); if (screen === "landing" || screen === "auth") setScreen("lobby");
+    setProfile(data); setGuest(null); ls.del("rt_guest");
+    setScreen(s => (s === "landing" || s === "auth" || s === "guest") ? "lobby" : s);
   }
 
-  /* ---------- connect socket once we have an identity ---------- */
+  /* ---------- socket once identity exists ---------- */
   useEffect(() => {
     if (!me) return;
     if (!socket.connected) socket.connect();
@@ -137,9 +179,9 @@ export default function App() {
     socket.on("signal", onSignal);
 
     socket.on("matched", async ({ roomId, peerId, peer, initiator }) => {
-      roomRef.current = roomId; setMatch({ roomId, peerId, peer, initiator });
-      setMessages([]); setSeconds(0); setMuted(false); setMonitored(false);
-      setIncoming(null); setScreen("incall");
+      roomRef.current = roomId; callStartRef.current = Date.now();
+      setMatch({ roomId, peerId, peer, initiator });
+      setMessages([]); setMuted(false); setMonitored(false); setIncoming(null); setScreen("incall");
       await media.current.initMic();
       if (initiator) media.current.call(peerId);
     });
@@ -165,11 +207,11 @@ export default function App() {
     return () => { socket.off("signal", onSignal); socket.removeAllListeners(); };
   }, [me?.id, guest?.name]);
 
-  useEffect(() => { if (screen !== "incall") return; const t = setInterval(() => setSeconds(s => s + 1), 1000); return () => clearInterval(t); }, [screen]);
   useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [messages]);
   useEffect(() => { if (session) loadFriends(); }, [session, screen === "friends"]);
 
   /* ---------- actions ---------- */
+  function startGuest(g) { setGuest(g); ls.set("rt_guest", JSON.stringify(g)); setScreen("lobby"); }
   function startCall() {
     const m = (mode === "friend" || mode === "conference") ? "discover" : mode;
     setScreen("matching");
@@ -179,7 +221,7 @@ export default function App() {
   function endLocal(skipAuto) {
     media.current?.closeAll(); setStreams({});
     const mt = matchRef.current;
-    if (mt) setHistory(h => [{ name: mt.peer?.name, loc: mt.peer?.loc, dur: secRef.current, when: "Just now" }, ...h].slice(0, 15));
+    if (mt) { const dur = Math.floor((Date.now() - callStartRef.current) / 1000); setHistory(h => [{ name: mt.peer?.name, loc: mt.peer?.loc, dur, when: "Just now" }, ...h].slice(0, 15)); }
     if (!skipAuto && autoRef.current) { setMatch(null); startCall(); }
     else { setMatch(null); roomRef.current = null; setScreen("lobby"); }
   }
@@ -213,7 +255,7 @@ export default function App() {
     return () => clearTimeout(t);
   }, [findQ]);
 
-  function signOut() { socket.disconnect(); supabase.auth.signOut(); setProfile(null); setGuest(null); setSession(null); setScreen("landing"); }
+  function signOut() { socket.disconnect(); supabase.auth.signOut(); ls.del("rt_guest"); setProfile(null); setGuest(null); setSession(null); setScreen("landing"); }
 
   function adminRefresh() { socket.emit("admin:rooms"); }
   function adminListen(roomId) { routeRef.current = adminMedia.current; setAdminCall(roomId); setAdminTalking(false); setAdminStreams({}); socket.emit("admin:monitor", { roomId, talk: false }); }
@@ -228,6 +270,8 @@ export default function App() {
   useEffect(() => { if (screen === "admin") { adminRefresh(); const t = setInterval(adminRefresh, 4000); return () => clearInterval(t); } }, [screen]);
 
   /* =================== RENDER =================== */
+  if (!consented) return <Consent onAgree={() => { ls.set("rt_consent_v1", "1"); setConsented(true); }} />;
+  if (booting) return <div className="min-h-screen flex items-center justify-center text-gray-400">Loading…</div>;
 
   /* LANDING */
   if (screen === "landing")
@@ -255,7 +299,7 @@ export default function App() {
     return <GuestSetup onBack={() => setScreen("landing")} onLocOpen={() => setLocOpen(true)}
       LocPicker={locOpen ? <LocationPicker onClose={() => setLocOpen(false)} onPick={(l) => { setGuest(g => ({ ...(g || {}), _loc: l })); setLocOpen(false); }} /> : null}
       pickedLoc={guest?._loc}
-      onStart={({ name, gender }) => { const l = guest?._loc; setGuest({ name: name || "Guest", gender, loc: l?.label || "", coord: l ? [l.lat, l.lng] : null }); setScreen("lobby"); }} />;
+      onStart={({ name, gender }) => { const l = guest?._loc; startGuest({ name: name || "Guest", gender, loc: l?.label || "", coord: l ? [l.lat, l.lng] : null }); }} />;
 
   /* LOBBY */
   if (screen === "lobby" && me)
@@ -310,7 +354,7 @@ export default function App() {
         </div>
 
         {incoming && <IncomingCall from={incoming.from} onAccept={acceptInvite} onDecline={() => setIncoming(null)} />}
-        {locOpen && <LocationPicker onClose={() => setLocOpen(false)} onPick={async (l) => { setLocOpen(false); if (guest) setGuest(g => ({ ...g, loc: l.label, coord: [l.lat, l.lng] })); else { await supabase.from("profiles").update({ loc: l.label, lat: l.lat, lng: l.lng }).eq("id", session.user.id); loadProfile(); } }} />}
+        {locOpen && <LocationPicker onClose={() => setLocOpen(false)} onPick={async (l) => { setLocOpen(false); if (guest) { const g = { ...guest, loc: l.label, coord: [l.lat, l.lng] }; setGuest(g); ls.set("rt_guest", JSON.stringify(g)); } else { await supabase.from("profiles").update({ loc: l.label, lat: l.lat, lng: l.lng }).eq("id", session.user.id); loadProfile(); } }} />}
         {overlay === "premium" && <Premium onClose={() => setOverlay(null)} onPay={(plan) => checkout({ plan, userId: session?.user?.id, onDone: () => { setOverlay(null); setTimeout(loadProfile, 2500); } })} />}
       </Page>
     );
@@ -365,14 +409,17 @@ export default function App() {
 
         <div className="mt-4 flex flex-col items-center text-center">
           <div className={`relative h-20 w-20 rounded-full text-white flex items-center justify-center text-2xl font-semibold ${aColor(match.peer?.name)}`}>{match.peer?.name?.[0]}<span className="absolute bottom-0 right-0 h-4 w-4 rounded-full bg-emerald-500 border-2 border-white" /></div>
-          <div className="mt-3 text-xl font-medium">{match.peer?.name}</div>
-          <div className="flex items-center gap-2 text-sm text-gray-500 mt-1"><span className="capitalize flex items-center gap-1"><GenderIcon g={match.peer?.gender} className="text-base" />{match.peer?.gender}</span>{match.peer?.loc && <span className="flex items-center gap-1"><MapPin className="h-3.5 w-3.5" />{match.peer.loc}</span>}</div>
-          <div className="mt-2 font-mono text-gray-400">{fmt(seconds)}</div>
+          <div className="mt-3 text-xl font-medium">{match.peer?.name || "Stranger"}</div>
+          <div className="flex items-center gap-3 text-sm text-gray-500 mt-1">
+            <span className="capitalize flex items-center gap-1"><GenderIcon g={match.peer?.gender} className="text-base" />{match.peer?.gender || "—"}</span>
+            <span className="flex items-center gap-1"><MapPin className="h-3.5 w-3.5" />{match.peer?.loc || "Location hidden"}</span>
+          </div>
+          <CallTimer />
         </div>
 
         <div className="mt-4 grid grid-cols-2 gap-3">
           <div className="rounded-2xl border border-gray-200 p-2"><Wave active={!muted} color="bg-blue-500" /><div className="text-center text-xs text-gray-400 mt-1">You {muted && "(muted)"}</div></div>
-          <div className="rounded-2xl border border-gray-200 p-2"><Wave active color="bg-emerald-500" /><div className="text-center text-xs text-gray-400 mt-1">{match.peer?.name}</div></div>
+          <div className="rounded-2xl border border-gray-200 p-2"><Wave active color="bg-emerald-500" /><div className="text-center text-xs text-gray-400 mt-1">{match.peer?.name || "Stranger"}</div></div>
         </div>
 
         <div ref={chatRef} className="flex-1 overflow-y-auto my-3 space-y-2 pr-1">
@@ -467,23 +514,61 @@ export default function App() {
   return <div className="min-h-screen flex items-center justify-center text-gray-400">Loading…</div>;
 }
 
-/* ---------------- sub-components ---------------- */
+/* ---------------- Location picker: Country → State → City ---------------- */
 function LocationPicker({ onClose, onPick }) {
-  const [country, setCountry] = useState("");
+  const [country, setCountry] = useState(null);
+  const [stateSel, setStateSel] = useState(null);
   const [q, setQ] = useState("");
-  const [res, setRes] = useState([]);
-  const countries = getCountries();
-  useEffect(() => { const t = setTimeout(() => setRes(searchCities(q, country || null)), 250); return () => clearTimeout(t); }, [q, country]);
+  const num = (v, f = 0) => { const n = parseFloat(v); return Number.isFinite(n) ? n : f; };
+
+  const countries = useMemo(() => getCountries(), []);
+  const states = useMemo(() => (country ? getStates(country.isoCode) : []), [country]);
+  const cities = useMemo(() => {
+    if (!country) return [];
+    if (stateSel) return getCities(country.isoCode, stateSel.isoCode);
+    if (states.length === 0) return getCitiesOfCountry(country.isoCode);
+    return [];
+  }, [country, stateSel, states]);
+
+  const level = !country ? "country" : (!stateSel && states.length > 0 ? "state" : "city");
+  const base = level === "country" ? countries : level === "state" ? states : cities;
+  const ql = q.trim().toLowerCase();
+  const list = (ql ? base.filter(x => x.name.toLowerCase().includes(ql)) : base).slice(0, 100);
+
+  const back = () => { setQ(""); if (stateSel) setStateSel(null); else if (country) setCountry(null); else onClose(); };
+  const placeholder = level === "country" ? "Search country" : level === "state" ? "Search state / province" : "Search city / district";
+  const crumb = [country?.name, stateSel?.name].filter(Boolean).join(" › ") || "Choose location";
+
+  function choose(item) {
+    if (level === "country") { setCountry(item); setQ(""); }
+    else if (level === "state") { setStateSel(item); setQ(""); }
+    else {
+      const label = stateSel ? `${item.name}, ${stateSel.name}, ${country.name}` : `${item.name}, ${country.name}`;
+      onPick({ label, lat: num(item.latitude, num(country.latitude)), lng: num(item.longitude, num(country.longitude)) });
+    }
+  }
+
   return (
     <div className="fixed inset-0 bg-white z-50 flex justify-center">
       <div className="w-full max-w-md flex flex-col px-5 py-5">
-        <div className="flex items-center gap-2 mb-3"><button onClick={onClose} className="p-2 -ml-2 rounded-full hover:bg-gray-100"><ArrowLeft className="h-5 w-5 text-gray-600" /></button><span className="text-lg font-medium">Choose location</span></div>
-        <select value={country} onChange={e => setCountry(e.target.value)} className="border border-gray-300 rounded-xl px-3 py-2.5 mb-2 text-base outline-none focus:border-blue-600"><option value="">All countries</option>{countries.map(c => <option key={c.isoCode} value={c.isoCode}>{c.flag} {c.name}</option>)}</select>
-        <div className="flex items-center gap-2 border border-gray-300 rounded-full px-4 py-2.5 focus-within:border-blue-600"><Search className="h-4 w-4 text-gray-400" /><input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="Search city / district" className="flex-1 outline-none text-base" /></div>
-        <div className="text-xs text-gray-400 mt-2">Tip: pick a country first for faster results.</div>
+        <div className="flex items-center gap-2 mb-1"><button onClick={back} className="p-2 -ml-2 rounded-full hover:bg-gray-100"><ArrowLeft className="h-5 w-5 text-gray-600" /></button><span className="text-lg font-medium truncate">{crumb}</span></div>
+        <div className="text-xs text-gray-400 mb-2">{level === "country" ? "Pick your country" : level === "state" ? "Pick a state/province — or use the whole country" : "Pick a city/district — or use the whole state"}</div>
+
+        <div className="flex items-center gap-2 border border-gray-300 rounded-full px-4 py-2.5 focus-within:border-blue-600"><Search className="h-4 w-4 text-gray-400" /><input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder={placeholder} className="flex-1 outline-none text-base" /></div>
+
+        {country && !stateSel && <button onClick={() => onPick({ label: country.name, lat: num(country.latitude), lng: num(country.longitude) })} className="mt-2 text-sm text-blue-600 text-left">Use {country.name} (whole country)</button>}
+        {stateSel && <button onClick={() => onPick({ label: `${stateSel.name}, ${country.name}`, lat: num(stateSel.latitude, num(country.latitude)), lng: num(stateSel.longitude, num(country.longitude)) })} className="mt-2 text-sm text-blue-600 text-left">Use {stateSel.name} (whole state)</button>}
+
         <div className="flex-1 overflow-y-auto mt-2">
-          {res.map((l, i) => <button key={i} onClick={() => onPick(l)} className="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-gray-50 rounded-xl text-left"><MapPin className="h-4 w-4 text-gray-400" /><span className="flex-1 text-base">{l.label}</span></button>)}
-          {q.length >= 2 && res.length === 0 && <div className="text-center text-sm text-gray-400 py-8">No matches</div>}
+          {list.map((item, i) => (
+            <button key={item.isoCode || item.name + i} onClick={() => choose(item)} className="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-gray-50 rounded-xl text-left">
+              <span className="text-base">{level === "country" ? item.flag : <MapPin className="h-4 w-4 text-gray-400 inline" />}</span>
+              <span className="flex-1 text-base">{item.name}</span>
+              {level !== "city" && <ArrowLeft className="h-4 w-4 text-gray-300 rotate-180" />}
+            </button>
+          ))}
+          {base.length === 0 && <div className="text-center text-sm text-gray-400 py-8">No options — use the button above.</div>}
+          {ql && list.length === 0 && base.length > 0 && <div className="text-center text-sm text-gray-400 py-8">No matches</div>}
         </div>
       </div>
     </div>
